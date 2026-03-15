@@ -5,7 +5,8 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
-import android.graphics.SurfaceTexture
+import android.graphics.Matrix
+import android.graphics.RectF
 import android.hardware.camera2.*
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.RggbChannelVector
@@ -19,6 +20,7 @@ import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
+import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -175,16 +177,24 @@ class MainActivity : AppCompatActivity() {
             val characteristics = cameraManager.getCameraCharacteristics(cameraId)
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             
-            // Find largest 4:3 or 3:4 resolution
+            // Find largest 4:3 or 3:4 resolution for JPEG
             val sizes = map?.getOutputSizes(ImageFormat.JPEG) ?: emptyArray()
             val largestJpeg = sizes.filter { 
                 val aspect = it.width.toFloat() / it.height.toFloat()
                 Math.abs(aspect - 4f/3f) < 0.05 || Math.abs(aspect - 3f/4f) < 0.05
             }.maxByOrNull { it.width * it.height } ?: sizes.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
 
+            // Find best 4:3 resolution for Preview
+            val previewSizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
+            val bestPreview = previewSizes.filter {
+                val aspect = it.width.toFloat() / it.height.toFloat()
+                Math.abs(aspect - 4f/3f) < 0.05 || Math.abs(aspect - 3f/4f) < 0.05
+            }.maxByOrNull { it.width * it.height } ?: Size(1440, 1080) // Fallback standard 4:3
+
             val texture = binding.textureView.surfaceTexture!!
-            // Use standard 1080p preview size (you'd typically query supported sizes)
-            texture.setDefaultBufferSize(1920, 1080)
+            texture.setDefaultBufferSize(bestPreview.width, bestPreview.height)
+            configureTransform(binding.textureView.width, binding.textureView.height, bestPreview.width, bestPreview.height)
+            
             val previewSurface = Surface(texture)
 
             // Setup ImageReader for AI analysis (lower res for speed)
@@ -234,6 +244,40 @@ class MainActivity : AppCompatActivity() {
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Failed creating capture session", e)
         }
+    }
+
+    private fun configureTransform(viewWidth: Int, viewHeight: Int, previewWidth: Int, previewHeight: Int) {
+        val matrix = Matrix()
+        val viewRect = RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat())
+        val bufferRect = RectF(0f, 0f, previewHeight.toFloat(), previewWidth.toFloat()) // Swapped for portrait
+        val centerX = viewRect.centerX()
+        val centerY = viewRect.centerY()
+
+        bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
+        matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+        
+        val scale = Math.max(
+            viewHeight.toFloat() / previewHeight,
+            viewWidth.toFloat() / previewWidth
+        )
+        matrix.postScale(scale, scale, centerX, centerY)
+        
+        // Account for rotation (assuming portrait lock for this simple app)
+        val rotation = getSystemService(WindowManager::class.java).defaultDisplay?.rotation ?: Surface.ROTATION_0
+        if (Surface.ROTATION_90 == rotation || Surface.ROTATION_270 == rotation) {
+            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+            val scaleLandscape = Math.max(
+                viewHeight.toFloat() / previewWidth,
+                viewWidth.toFloat() / previewHeight
+            )
+            matrix.postScale(scaleLandscape, scaleLandscape, centerX, centerY)
+            matrix.postRotate(90f * (rotation - 2), centerX, centerY)
+        } else if (Surface.ROTATION_180 == rotation) {
+            matrix.postRotate(180f, centerX, centerY)
+        }
+        
+        binding.textureView.setTransform(matrix)
     }
 
     private fun setManualControlSettings(builder: CaptureRequest.Builder) {
