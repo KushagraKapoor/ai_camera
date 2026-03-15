@@ -13,8 +13,11 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.util.Size
+import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
+import android.view.View
+import android.widget.ImageView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -42,6 +45,8 @@ class MainActivity : AppCompatActivity() {
     // AI Control variables
     private var currentIso = 100
     private var currentExposureTime = 1000000000L / 30 // ~1/30s
+    private var sensorArraySize: android.graphics.Rect? = null
+    private var isFocusing = false
 
     private lateinit var stillImageReader: ImageReader
 
@@ -72,6 +77,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    @SuppressLint("ClickableViewAccessibility")
     override fun onResume() {
         super.onResume()
         startBackgroundThread()
@@ -79,6 +85,13 @@ class MainActivity : AppCompatActivity() {
             startCamera()
         } else {
             binding.textureView.surfaceTextureListener = textureListener
+        }
+        
+        binding.textureView.setOnTouchListener { view, event ->
+            if (event.action == MotionEvent.ACTION_DOWN) {
+                handleFocusTap(event.x, event.y, view.width, view.height)
+            }
+            true
         }
     }
 
@@ -122,6 +135,7 @@ class MainActivity : AppCompatActivity() {
                 val characteristics = cameraManager.getCameraCharacteristics(id)
                 val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
                 if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    sensorArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
                     cameraId = id
                     break
                 }
@@ -208,16 +222,70 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setManualControlSettings(builder: CaptureRequest.Builder) {
-        // Disable auto exposure, auto focus, and auto white balance
+        // Disable auto exposure and auto white balance
         builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-        builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
         builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
+
+        if (!isFocusing) {
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, 0.0f) 
+        }
 
         // Set initial manual values
         builder.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
         builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime)
-        // Set focus to infinity as a default manual setting
-        builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, 0.0f) 
+    }
+
+    private fun handleFocusTap(x: Float, y: Float, viewWidth: Int, viewHeight: Int) {
+        if (cameraDevice == null || captureSession == null || sensorArraySize == null) return
+        isFocusing = true
+
+        // 1. Animate UI Ring
+        val ring = binding.root.findViewById<ImageView>(R.id.ivFocusRing)
+        ring.translationX = x - (ring.width / 2)
+        ring.translationY = y - (ring.height / 2)
+        ring.visibility = View.VISIBLE
+        ring.alpha = 1f
+        ring.scaleX = 1.5f
+        ring.scaleY = 1.5f
+        ring.animate().scaleX(1f).scaleY(1f).setDuration(300).withEndAction {
+            ring.animate().alpha(0f).setStartDelay(1000).setDuration(300).withEndAction {
+                ring.visibility = View.GONE
+            }.start()
+        }.start()
+
+        // 2. Calculate coordinates on sensor
+        val sensorX = (x / viewWidth * sensorArraySize!!.width()).toInt()
+        val sensorY = (y / viewHeight * sensorArraySize!!.height()).toInt()
+        val halfTouchWidth = 150 
+        val halfTouchHeight = 150 
+        
+        val focusRect = android.graphics.Rect(
+            (sensorX - halfTouchWidth).coerceAtLeast(0),
+            (sensorY - halfTouchHeight).coerceAtLeast(0),
+            (sensorX + halfTouchWidth).coerceAtMost(sensorArraySize!!.width()),
+            (sensorY + halfTouchHeight).coerceAtMost(sensorArraySize!!.height())
+        )
+        val meteringRectangle = MeteringRectangle(focusRect, MeteringRectangle.METERING_WEIGHT_MAX)
+
+        // 3. Command Camera to Focus
+        try {
+            captureSession!!.stopRepeating()
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(meteringRectangle))
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+            
+            captureSession!!.capture(captureRequestBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
+                 override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                     isFocusing = false
+                     // Return to repeating our manual exposure stream
+                     captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                     updateCameraPreview()
+                 }
+            }, backgroundHandler)
+        } catch (e: CameraAccessException) {
+            Log.e(TAG, "Failed manual focus", e)
+        }
     }
 
     private val onImageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
@@ -251,14 +319,15 @@ class MainActivity : AppCompatActivity() {
     private fun adjustSettingsBasedOnAI(luminance: Double) {
         // Target luminance (approx 128 for mid-grey)
         val targetLuminance = 120.0
-        val tolerance = 15.0
+        // User requested lower sensitivity/higher threshold before bouncing settings
+        val tolerance = 25.0 
         
         var needsUpdate = false
         
         if (luminance < (targetLuminance - tolerance)) {
             // Unexdeposed: Increase ISO or Exposure Time
             if (currentIso < 800) {
-                currentIso += 50
+                currentIso += 25 // Smoother ramping
                 needsUpdate = true
             } else if (currentExposureTime < 1000000000L / 10) { // Max 1/10s
                 currentExposureTime += 5000000L
@@ -267,7 +336,7 @@ class MainActivity : AppCompatActivity() {
         } else if (luminance > (targetLuminance + tolerance)) {
             // Overexposed: Decrease ISO or Exposure Time
             if (currentIso > 50) {
-                currentIso -= 50
+                currentIso -= 25 // Smoother ramping
                 needsUpdate = true
             } else if (currentExposureTime > 1000000000L / 1000) { // Min 1/1000s
                 currentExposureTime -= 2000000L
