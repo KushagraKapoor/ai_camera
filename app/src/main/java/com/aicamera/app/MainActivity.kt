@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
+import android.hardware.camera2.params.MeteringRectangle
 import android.media.ImageReader
 import android.os.Bundle
 import android.os.Handler
