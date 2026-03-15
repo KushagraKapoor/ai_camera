@@ -8,6 +8,7 @@ import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.params.MeteringRectangle
+import android.hardware.camera2.params.RggbChannelVector
 import android.media.ImageReader
 import android.os.Bundle
 import android.os.Handler
@@ -46,6 +47,8 @@ class MainActivity : AppCompatActivity() {
     // AI Control variables
     private var currentIso = 100
     private var currentExposureTime = 1000000000L / 30 // ~1/30s
+    private var currentRGain = 1.5f
+    private var currentBGain = 1.5f
     private var sensorArraySize: android.graphics.Rect? = null
     private var isFocusing = false
 
@@ -170,7 +173,13 @@ class MainActivity : AppCompatActivity() {
         try {
             val characteristics = cameraManager.getCameraCharacteristics(cameraId)
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val largestJpeg = map?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
+            
+            // Find largest 4:3 or 3:4 resolution
+            val sizes = map?.getOutputSizes(ImageFormat.JPEG) ?: emptyArray()
+            val largestJpeg = sizes.filter { 
+                val aspect = it.width.toFloat() / it.height.toFloat()
+                Math.abs(aspect - 4f/3f) < 0.05 || Math.abs(aspect - 3f/4f) < 0.05
+            }.maxByOrNull { it.width * it.height } ?: sizes.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
 
             val texture = binding.textureView.surfaceTexture!!
             // Use standard 1080p preview size (you'd typically query supported sizes)
@@ -239,6 +248,10 @@ class MainActivity : AppCompatActivity() {
         // Set initial manual values
         builder.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
         builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime)
+        
+        // Manual White Balance (AI Controlled)
+        builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+        builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
     }
 
     private fun handleFocusTap(x: Float, y: Float, viewWidth: Int, viewHeight: Int) {
@@ -303,25 +316,42 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun analyzeImage(image: android.media.Image) {
-        // Implementation for AI logic will go here.
-        // Reading Y-plane for luminance
-        val yPlane = image.planes[0]
-        val buffer = yPlane.buffer
-        val data = ByteArray(buffer.remaining())
-        buffer.get(data)
-        
-        // Simple heuristic: calculate average luminance
-        var sum = 0L
-        for (byte in data) {
-            sum += (byte.toInt() and 0xFF)
-        }
-        val avgLuminance = sum / data.size.toDouble()
+        if (image.planes.size < 3) return
 
-        // This runs on background thread, adjust settings based on luminance
-        adjustSettingsBasedOnAI(avgLuminance)
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+
+        // Extract Luminance
+        val yBuffer = yPlane.buffer
+        val yData = ByteArray(yBuffer.remaining())
+        yBuffer.get(yData)
+        var sumY = 0L
+        for (byte in yData) {
+            sumY += (byte.toInt() and 0xFF)
+        }
+        val avgLuminance = sumY / yData.size.toDouble()
+
+        // Extract U and V for Color/White Balance
+        val uBuffer = uPlane.buffer
+        var sumU = 0L
+        for (i in 0 until uBuffer.remaining() step uPlane.pixelStride) {
+            sumU += (uBuffer[i].toInt() and 0xFF)
+        }
+        val avgU = if (uBuffer.remaining() > 0) sumU / (uBuffer.remaining() / uPlane.pixelStride.toDouble()) else 128.0
+
+        val vBuffer = vPlane.buffer
+        var sumV = 0L
+        for (i in 0 until vBuffer.remaining() step vPlane.pixelStride) {
+            sumV += (vBuffer[i].toInt() and 0xFF)
+        }
+        val avgV = if (vBuffer.remaining() > 0) sumV / (vBuffer.remaining() / vPlane.pixelStride.toDouble()) else 128.0
+
+        // This runs on background thread, adjust settings based on luminance and color
+        adjustSettingsBasedOnAI(avgLuminance, avgU, avgV)
     }
     
-    private fun adjustSettingsBasedOnAI(luminance: Double) {
+    private fun adjustSettingsBasedOnAI(luminance: Double, uCol: Double, vCol: Double) {
         // Target luminance (approx 128 for mid-grey)
         val targetLuminance = 120.0
         // User requested lower sensitivity/higher threshold before bouncing settings
@@ -350,6 +380,26 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // White Balance Adjustments
+        // In YUV, neutral gray means U and V are close to 128
+        val colorTolerance = 5.0
+        
+        if (vCol > 128.0 + colorTolerance && currentRGain > 1.0f) {
+            currentRGain -= 0.05f // Too warm, reduce Red
+            needsUpdate = true
+        } else if (vCol < 128.0 - colorTolerance && currentRGain < 3.0f) {
+            currentRGain += 0.05f 
+            needsUpdate = true
+        }
+
+        if (uCol > 128.0 + colorTolerance && currentBGain > 1.0f) {
+            currentBGain -= 0.05f // Too cool, reduce Blue
+            needsUpdate = true
+        } else if (uCol < 128.0 - colorTolerance && currentBGain < 3.0f) {
+            currentBGain += 0.05f
+            needsUpdate = true
+        }
+
         if (needsUpdate) {
             updateCameraPreview()
             CoroutineScope(Dispatchers.Main).launch {
@@ -368,6 +418,7 @@ class MainActivity : AppCompatActivity() {
         try {
             captureRequestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
             captureRequestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime)
+            captureRequestBuilder.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
             captureSession!!.setRepeatingRequest(captureRequestBuilder.build(), null, backgroundHandler)
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Update preview failed", e)
@@ -384,6 +435,7 @@ class MainActivity : AppCompatActivity() {
             setManualControlSettings(captureBuilder)
             captureBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
             captureBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime)
+            captureBuilder.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
 
             // Orientation handling can be added here
             
