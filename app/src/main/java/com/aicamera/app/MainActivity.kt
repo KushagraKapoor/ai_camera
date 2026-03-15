@@ -49,6 +49,7 @@ class MainActivity : AppCompatActivity() {
     private var currentExposureTime = 1000000000L / 30 // ~1/30s
     private var currentRGain = 1.5f
     private var currentBGain = 1.5f
+    private var currentFocusDistance = 0.0f // 0.0f = infinity
     private var sensorArraySize: android.graphics.Rect? = null
     private var isFocusing = false
 
@@ -242,7 +243,7 @@ class MainActivity : AppCompatActivity() {
 
         if (!isFocusing) {
             builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, 0.0f) 
+            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, currentFocusDistance) 
         }
 
         // Set initial manual values
@@ -296,7 +297,14 @@ class MainActivity : AppCompatActivity() {
             captureSession!!.capture(captureRequestBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
                  override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
                      isFocusing = false
-                     // Return to repeating our manual exposure stream
+                     
+                     // Retrieve the actual focus distance the lens just locked onto
+                     val focusDistance = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
+                     if (focusDistance != null) {
+                         currentFocusDistance = focusDistance
+                     }
+
+                     // Return to repeating our manual exposure stream with the new locked focus
                      captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
                      updateCameraPreview()
                  }
