@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">AI Camera</string>
+    <string name="capture">Capture</string>
+    <string name="ai_status">AI Status: Analyzing...</string>
+</resources>
