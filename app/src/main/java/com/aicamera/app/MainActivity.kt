@@ -168,6 +168,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun createCameraPreviewSession() {
         try {
+            val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+            val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val largestJpeg = map?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
+
             val texture = binding.textureView.surfaceTexture!!
             // Use standard 1080p preview size (you'd typically query supported sizes)
             texture.setDefaultBufferSize(1920, 1080)
@@ -178,7 +182,7 @@ class MainActivity : AppCompatActivity() {
             imageReader.setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
 
             // Setup ImageReader for high-quality capture
-            stillImageReader = ImageReader.newInstance(1920, 1080, ImageFormat.JPEG, 1)
+            stillImageReader = ImageReader.newInstance(largestJpeg.width, largestJpeg.height, ImageFormat.JPEG, 1)
             stillImageReader.setOnImageAvailableListener({ reader ->
                 val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
                 FileUtils.saveImage(this, image)
