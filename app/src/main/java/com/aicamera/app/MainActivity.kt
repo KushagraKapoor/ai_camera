@@ -53,6 +53,7 @@ class MainActivity : AppCompatActivity() {
     private var currentBGain = 1.5f
     private var currentFocusDistance = 0.0f // 0.0f = infinity
     private var sensorArraySize: android.graphics.Rect? = null
+    private var sensorOrientation = 0
     private var isFocusing = false
 
     private lateinit var stillImageReader: ImageReader
@@ -146,6 +147,7 @@ class MainActivity : AppCompatActivity() {
                 val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
                 if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
                     sensorArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                    sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
                     cameraId = id
                     break
                 }
@@ -507,7 +509,10 @@ class MainActivity : AppCompatActivity() {
             captureBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime)
             captureBuilder.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
 
-            // Orientation handling can be added here
+            // Orientation handling
+            val rotation = getSystemService(WindowManager::class.java).defaultDisplay?.rotation ?: Surface.ROTATION_0
+            val jpegOrientation = (ORIENTATIONS.get(rotation) + sensorOrientation + 270) % 360
+            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
             
             captureSession?.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
@@ -546,6 +551,12 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "AICamera"
+        private val ORIENTATIONS = android.util.SparseIntArray().apply {
+            append(Surface.ROTATION_0, 90)
+            append(Surface.ROTATION_90, 0)
+            append(Surface.ROTATION_180, 270)
+            append(Surface.ROTATION_270, 180)
+        }
         private val REQUIRED_PERMISSIONS = mutableListOf(
             Manifest.permission.CAMERA
         ).apply {
