@@ -4,6 +4,9 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
+import android.content.ContentValues
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.RectF
@@ -13,6 +16,7 @@ import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.RggbChannelVector
 import android.media.ImageReader
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -58,6 +62,7 @@ class MainActivity : AppCompatActivity() {
     private var isFocusing = false
 
     private lateinit var stillImageReader: ImageReader
+    private val capturedHdrImages = mutableListOf<ByteArray>()
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
@@ -178,6 +183,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+        val rotation = getSystemService(WindowManager::class.java).defaultDisplay?.rotation ?: Surface.ROTATION_0
+        val jpegOrientation = (ORIENTATIONS.get(rotation) + sensorOrientation + 270) % 360
+        return jpegOrientation
+    }
+
     private fun createCameraPreviewSession() {
         try {
             val characteristics = cameraManager.getCameraCharacteristics(cameraId)
@@ -207,15 +217,23 @@ class MainActivity : AppCompatActivity() {
             imageReader = ImageReader.newInstance(640, 480, ImageFormat.YUV_420_888, 2)
             imageReader.setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
 
-            // Setup ImageReader for high-quality capture
-            stillImageReader = ImageReader.newInstance(largestJpeg.width, largestJpeg.height, ImageFormat.JPEG, 1)
+            // Setup ImageReader for HDR Burst Capture (capacity 3)
+            stillImageReader = ImageReader.newInstance(largestJpeg.width, largestJpeg.height, ImageFormat.JPEG, 3)
             stillImageReader.setOnImageAvailableListener({ reader ->
                 try {
-                    val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                    FileUtils.saveImage(this, image)
+                    val image = reader.acquireNextImage() ?: return@setOnImageAvailableListener
+                    val buffer = image.planes[0].buffer
+                    val bytes = ByteArray(buffer.remaining())
+                    buffer.get(bytes)
+                    capturedHdrImages.add(bytes)
                     image.close()
-                    CoroutineScope(Dispatchers.Main).launch {
-                        Toast.makeText(this@MainActivity, "Photo saved!", Toast.LENGTH_SHORT).show()
+
+                    if (capturedHdrImages.size == 3) {
+                        val imagesToProcess = capturedHdrImages.toList()
+                        capturedHdrImages.clear()
+                        CoroutineScope(Dispatchers.Default).launch {
+                            processHdrAndSave(imagesToProcess)
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error acquiring still image", e)
@@ -501,29 +519,138 @@ class MainActivity : AppCompatActivity() {
     private fun takePhoto() {
         if (cameraDevice == null) return
         try {
-            val captureBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-            captureBuilder.addTarget(stillImageReader.surface)
-            
-            // Apply current AI settings to the final shot
-            setManualControlSettings(captureBuilder)
-            captureBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
-            captureBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime)
-            captureBuilder.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
+            val jpegOrientation = getJpegOrientation()
 
-            // Orientation handling
-            val rotation = getSystemService(WindowManager::class.java).defaultDisplay?.rotation ?: Surface.ROTATION_0
-            val jpegOrientation = (ORIENTATIONS.get(rotation) + sensorOrientation + 270) % 360
-            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
+            // Request 1: Highlight Recovery (Underexposed - 1/2 exposure time)
+            val captureBuilder1 = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            captureBuilder1.addTarget(stillImageReader.surface)
+            setManualControlSettings(captureBuilder1)
+            captureBuilder1.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
+            captureBuilder1.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime / 2)
+            captureBuilder1.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
+            captureBuilder1.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
+
+            // Request 2: Normal Exposure
+            val captureBuilder2 = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            captureBuilder2.addTarget(stillImageReader.surface)
+            setManualControlSettings(captureBuilder2)
+            captureBuilder2.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
+            captureBuilder2.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime)
+            captureBuilder2.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
+            captureBuilder2.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
+
+            // Request 3: Shadow Recovery (Overexposed - 2x exposure time)
+            val captureBuilder3 = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            captureBuilder3.addTarget(stillImageReader.surface)
+            setManualControlSettings(captureBuilder3)
+            captureBuilder3.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
+            captureBuilder3.set(CaptureRequest.SENSOR_EXPOSURE_TIME, (currentExposureTime * 2).coerceAtMost(1000000000L / 10)) // Max 1/10s
+            captureBuilder3.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
+            captureBuilder3.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
+
+            capturedHdrImages.clear()
+
+            captureSession?.captureBurst(
+                listOf(captureBuilder1.build(), captureBuilder2.build(), captureBuilder3.build()),
+                object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureSequenceCompleted(session: CameraCaptureSession, sequenceId: Int, frameNumber: Long) {
+                        super.onCaptureSequenceCompleted(session, sequenceId, frameNumber)
+                        Log.d(TAG, "HDR Burst Capture Sequence Complete")
+                    }
+                }, null
+            )
             
-            captureSession?.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                    super.onCaptureCompleted(session, request, result)
-                    Log.d(TAG, "Capture complete")
-                }
-            }, null)
+            CoroutineScope(Dispatchers.Main).launch {
+                Toast.makeText(this@MainActivity, "Capturing HDR Burst...", Toast.LENGTH_SHORT).show()
+            }
             
         } catch (e: CameraAccessException) {
-            Log.e(TAG, "Capture failed", e)
+            Log.e(TAG, "Capture Burst failed", e)
+        }
+    }
+
+    private suspend fun processHdrAndSave(images: List<ByteArray>) {
+        withContext(Dispatchers.Main) {
+            binding.tvAiStatus.text = "AI Status: Processing HDR Pipeline..."
+        }
+        
+        try {
+            // Decode with downsampling (inSampleSize = 2) to prevent OutOfMemoryError on 50MP images
+            val options = BitmapFactory.Options()
+            options.inSampleSize = 2 
+            
+            val bitmap1 = BitmapFactory.decodeByteArray(images[0], 0, images[0].size, options)
+            val bitmap2 = BitmapFactory.decodeByteArray(images[1], 0, images[1].size, options)
+            val bitmap3 = BitmapFactory.decodeByteArray(images[2], 0, images[2].size, options)
+            
+            if (bitmap1 != null && bitmap2 != null && bitmap3 != null) {
+                val width = bitmap1.width
+                val height = bitmap1.height
+                val resultBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                
+                // Simple AI HDR logic: Exposure Fusion Averaging
+                val pixels1 = IntArray(width * height)
+                val pixels2 = IntArray(width * height)
+                val pixels3 = IntArray(width * height)
+                
+                bitmap1.getPixels(pixels1, 0, width, 0, 0, width, height)
+                bitmap2.getPixels(pixels2, 0, width, 0, 0, width, height)
+                bitmap3.getPixels(pixels3, 0, width, 0, 0, width, height)
+                
+                val resultPixels = IntArray(width * height)
+                for (i in resultPixels.indices) {
+                    val p1 = pixels1[i]
+                    val p2 = pixels2[i]
+                    val p3 = pixels3[i]
+                    
+                    val r = ((android.graphics.Color.red(p1) + android.graphics.Color.red(p2) + android.graphics.Color.red(p3)) / 3).coerceIn(0, 255)
+                    val g = ((android.graphics.Color.green(p1) + android.graphics.Color.green(p2) + android.graphics.Color.green(p3)) / 3).coerceIn(0, 255)
+                    val b = ((android.graphics.Color.blue(p1) + android.graphics.Color.blue(p2) + android.graphics.Color.blue(p3)) / 3).coerceIn(0, 255)
+                    
+                    resultPixels[i] = android.graphics.Color.rgb(r, g, b)
+                }
+                
+                resultBitmap.setPixels(resultPixels, 0, width, 0, 0, width, height)
+                
+                // Save Result Bitmap
+                saveProcessedBitmap(resultBitmap)
+                
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "HDR Magic applied! Photo saved.", Toast.LENGTH_LONG).show()
+                }
+                
+                bitmap1.recycle()
+                bitmap2.recycle()
+                bitmap3.recycle()
+            }
+        } catch (e: OutOfMemoryError) {
+            Log.e(TAG, "OOM during HDR processing", e)
+            withContext(Dispatchers.Main) {
+                Toast.makeText(this@MainActivity, "Phone memory limits exceeded during HDR fusion.", Toast.LENGTH_LONG).show()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing HDR", e)
+            withContext(Dispatchers.Main) {
+                Toast.makeText(this@MainActivity, "HDR Processing Failed.", Toast.LENGTH_SHORT).show()
+            }
+        } finally {
+            withContext(Dispatchers.Main) {
+                binding.tvAiStatus.text = "AI Status: Optimal"
+            }
+        }
+    }
+
+    private fun saveProcessedBitmap(bitmap: Bitmap) {
+        val contentValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, "AI_HDR_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+        if (uri != null) {
+            contentResolver.openOutputStream(uri)?.use { out ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+            }
         }
     }
 
