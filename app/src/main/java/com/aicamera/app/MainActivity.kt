@@ -19,6 +19,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
+import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
 import android.view.MotionEvent
@@ -183,6 +184,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun getJpegOrientation(): Int {
         val rotation = getSystemService(WindowManager::class.java).defaultDisplay?.rotation ?: Surface.ROTATION_0
         val jpegOrientation = (ORIENTATIONS.get(rotation) + sensorOrientation + 270) % 360
         return jpegOrientation
