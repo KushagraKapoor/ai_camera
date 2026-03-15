@@ -109,8 +109,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startBackgroundThread() {
-        backgroundThread = HandlerThread("CameraBackground").also { it.start() }
-        backgroundHandler = Handler(backgroundThread!!.looper)
+        if (backgroundThread == null) {
+            backgroundThread = HandlerThread("CameraBackground").also { it.start() }
+            backgroundHandler = Handler(backgroundThread!!.looper)
+        }
     }
 
     private fun stopBackgroundThread() {
@@ -118,6 +120,7 @@ class MainActivity : AppCompatActivity() {
         try {
             backgroundThread?.join()
             backgroundThread = null
+            backgroundHandler?.removeCallbacksAndMessages(null)
             backgroundHandler = null
         } catch (e: InterruptedException) {
             Log.e(TAG, "Interrupted while stopping background thread", e)
@@ -204,11 +207,15 @@ class MainActivity : AppCompatActivity() {
             // Setup ImageReader for high-quality capture
             stillImageReader = ImageReader.newInstance(largestJpeg.width, largestJpeg.height, ImageFormat.JPEG, 1)
             stillImageReader.setOnImageAvailableListener({ reader ->
-                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                FileUtils.saveImage(this, image)
-                image.close()
-                CoroutineScope(Dispatchers.Main).launch {
-                    Toast.makeText(this@MainActivity, "Photo saved!", Toast.LENGTH_SHORT).show()
+                try {
+                    val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                    FileUtils.saveImage(this, image)
+                    image.close()
+                    CoroutineScope(Dispatchers.Main).launch {
+                        Toast.makeText(this@MainActivity, "Photo saved!", Toast.LENGTH_SHORT).show()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error acquiring still image", e)
                 }
             }, backgroundHandler)
 
@@ -359,11 +366,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val onImageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
-        val image = reader.acquireLatestImage() ?: return@OnImageAvailableListener
         try {
-            analyzeImage(image)
-        } finally {
-            image.close()
+            val image = reader.acquireLatestImage() ?: return@OnImageAvailableListener
+            try {
+                analyzeImage(image)
+            } finally {
+                image.close()
+            }
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "ImageReader acquired too many images or closed", e)
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception accessing image", e)
         }
     }
 
@@ -471,9 +484,14 @@ class MainActivity : AppCompatActivity() {
             captureRequestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
             captureRequestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime)
             captureRequestBuilder.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
-            captureSession!!.setRepeatingRequest(captureRequestBuilder.build(), null, backgroundHandler)
+            val handler = backgroundHandler
+            if (handler != null) {
+                captureSession!!.setRepeatingRequest(captureRequestBuilder.build(), null, handler)
+            }
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Update preview failed", e)
+        } catch (e: IllegalStateException) {
+            Log.e(TAG, "Session closed during preview update", e)
         }
     }
 
@@ -504,12 +522,21 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun closeCamera() {
-        captureSession?.close()
-        captureSession = null
-        cameraDevice?.close()
-        cameraDevice = null
-        if(::imageReader.isInitialized) {
-             imageReader.close()
+        try {
+            captureSession?.close()
+            captureSession = null
+            cameraDevice?.close()
+            cameraDevice = null
+            if (::imageReader.isInitialized) {
+                 imageReader.setOnImageAvailableListener(null, null)
+                 imageReader.close()
+            }
+            if (::stillImageReader.isInitialized) {
+                 stillImageReader.setOnImageAvailableListener(null, null)
+                 stillImageReader.close()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error closing camera resources", e)
         }
     }
 
