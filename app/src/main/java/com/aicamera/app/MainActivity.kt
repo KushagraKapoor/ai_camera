@@ -73,7 +73,6 @@ class MainActivity : AppCompatActivity() {
 
     private var isHdrEnabled = true
     private var isAeAfLocked = false
-    private var isUltraHighResSensor = false
     private lateinit var gestureDetector: GestureDetector
 
     /** A [Semaphore] to prevent the app from exiting before closing the camera. */
@@ -251,35 +250,12 @@ class MainActivity : AppCompatActivity() {
             val characteristics = cameraManager.getCameraCharacteristics(cameraId)
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             
-            var largestJpeg: Size? = null
-
-            // 1. Android 12+ Ultra High Resolution Sensor (50MP Unbinned Mode - IMX890/JN1)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val maxResMap = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP_MAXIMUM_RESOLUTION)
-                if (maxResMap != null) {
-                    val maxSizes = maxResMap.getOutputSizes(ImageFormat.JPEG) ?: emptyArray()
-                    val largestMaxRes = maxSizes.filter { 
-                        val aspect = it.width.toFloat() / it.height.toFloat()
-                        Math.abs(aspect - 4f/3f) < 0.05 || Math.abs(aspect - 3f/4f) < 0.05
-                    }.maxByOrNull { it.width * it.height } ?: maxSizes.maxByOrNull { it.width * it.height }
-                    
-                    // Verify it's actually an ultra-high resolution (e.g., > 16 Megapixels)
-                    if (largestMaxRes != null && largestMaxRes.width * largestMaxRes.height > 16000000) {
-                        largestJpeg = largestMaxRes
-                        isUltraHighResSensor = true
-                        Log.d(TAG, "50MP Maximum Resolution Output Activated: ${largestJpeg.width}x${largestJpeg.height}")
-                    }
-                }
-            }
-            
-            // 2. Fallback to standard binned resolutions (e.g. 12.5MP) if 50MP not supported
-            if (largestJpeg == null) {
-                val sizes = map?.getOutputSizes(ImageFormat.JPEG) ?: emptyArray()
-                largestJpeg = sizes.filter { 
-                    val aspect = it.width.toFloat() / it.height.toFloat()
-                    Math.abs(aspect - 4f/3f) < 0.05 || Math.abs(aspect - 3f/4f) < 0.05
-                }.maxByOrNull { it.width * it.height } ?: sizes.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
-            }
+            // Find largest 4:3 or 3:4 resolution for JPEG
+            val sizes = map?.getOutputSizes(ImageFormat.JPEG) ?: emptyArray()
+            val largestJpeg = sizes.filter { 
+                val aspect = it.width.toFloat() / it.height.toFloat()
+                Math.abs(aspect - 4f/3f) < 0.05 || Math.abs(aspect - 3f/4f) < 0.05
+            }.maxByOrNull { it.width * it.height } ?: sizes.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
 
             // Find best 4:3 resolution for Preview
             val previewSizes = map?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
@@ -341,10 +317,6 @@ class MainActivity : AppCompatActivity() {
                 val previewConfig = android.hardware.camera2.params.OutputConfiguration(previewSurface)
                 val analysisConfig = android.hardware.camera2.params.OutputConfiguration(imageReader.surface)
                 val stillConfig = android.hardware.camera2.params.OutputConfiguration(stillImageReader.surface)
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && isUltraHighResSensor) {
-                    stillConfig.addSensorPixelModeUsed(CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
-                }
 
                 val sessionConfig = android.hardware.camera2.params.SessionConfiguration(
                     android.hardware.camera2.params.SessionConfiguration.SESSION_REGULAR,
@@ -716,12 +688,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun applyMaxResolutionIfAvailable(builder: CaptureRequest.Builder) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && isUltraHighResSensor) {
-            builder.set(CaptureRequest.SENSOR_PIXEL_MODE, CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
-        }
-    }
-
     private fun takePhoto() {
         if (cameraDevice == null) return
         try {
@@ -732,7 +698,6 @@ class MainActivity : AppCompatActivity() {
                 val captureBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                 captureBuilder.addTarget(stillImageReader.surface)
                 setManualControlSettings(captureBuilder)
-                applyMaxResolutionIfAvailable(captureBuilder)
                 captureBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
                 captureBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime)
                 captureBuilder.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
@@ -746,14 +711,12 @@ class MainActivity : AppCompatActivity() {
                     override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
                         super.onCaptureFailed(session, request, failure)
                         Log.e(TAG, "Camera HAL rejected capture. Reason: ${failure.reason}")
-                        CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Capture Failed. Disabling 50MP.", Toast.LENGTH_LONG).show() }
-                        isUltraHighResSensor = false
+                        CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Capture Failed.", Toast.LENGTH_LONG).show() }
                     }
                 }, null)
                 
                 CoroutineScope(Dispatchers.Main).launch {
-                    val resString = if (isUltraHighResSensor) "50MP " else ""
-                    Toast.makeText(this@MainActivity, "Capturing ${resString}Photo...", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Capturing Photo...", Toast.LENGTH_SHORT).show()
                 }
                 return
             }
@@ -763,7 +726,6 @@ class MainActivity : AppCompatActivity() {
             val captureBuilder1 = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             captureBuilder1.addTarget(stillImageReader.surface)
             setManualControlSettings(captureBuilder1)
-            applyMaxResolutionIfAvailable(captureBuilder1)
             captureBuilder1.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
             captureBuilder1.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime / 2)
             captureBuilder1.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
@@ -773,7 +735,6 @@ class MainActivity : AppCompatActivity() {
             val captureBuilder2 = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             captureBuilder2.addTarget(stillImageReader.surface)
             setManualControlSettings(captureBuilder2)
-            applyMaxResolutionIfAvailable(captureBuilder2)
             captureBuilder2.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
             captureBuilder2.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime)
             captureBuilder2.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
@@ -783,7 +744,6 @@ class MainActivity : AppCompatActivity() {
             val captureBuilder3 = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             captureBuilder3.addTarget(stillImageReader.surface)
             setManualControlSettings(captureBuilder3)
-            applyMaxResolutionIfAvailable(captureBuilder3)
             captureBuilder3.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
             captureBuilder3.set(CaptureRequest.SENSOR_EXPOSURE_TIME, (currentExposureTime * 2).coerceAtMost(1000000000L / 10)) // Max 1/10s
             captureBuilder3.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
@@ -801,8 +761,7 @@ class MainActivity : AppCompatActivity() {
                     override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
                         super.onCaptureFailed(session, request, failure)
                         Log.e(TAG, "HDR Burst capture failed. Reason: ${failure.reason}")
-                        CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Burst Failed. Disabling 50MP.", Toast.LENGTH_LONG).show() }
-                        isUltraHighResSensor = false
+                        CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Burst Failed.", Toast.LENGTH_LONG).show() }
                     }
                 }, null
             )
@@ -822,9 +781,9 @@ class MainActivity : AppCompatActivity() {
         }
         
         try {
-            // Decode with downsampling (inSampleSize = 2 normally, 4 for 50MP) to prevent OutOfMemoryError
+            // Decode with downsampling (inSampleSize = 2) to prevent OutOfMemoryError
             val options = BitmapFactory.Options()
-            options.inSampleSize = if (isUltraHighResSensor) 4 else 2 
+            options.inSampleSize = 2 
             
             val bitmap1 = BitmapFactory.decodeByteArray(images[0], 0, images[0].size, options)
             val bitmap2 = BitmapFactory.decodeByteArray(images[1], 0, images[1].size, options)
