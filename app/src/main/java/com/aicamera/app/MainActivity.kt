@@ -841,29 +841,73 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveJpegBytes(bytes: ByteArray) {
+        val resolver = contentResolver
         val contentValues = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, "AI_CAM_${System.currentTimeMillis()}.jpg")
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
-        }
-        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-        if (uri != null) {
-            contentResolver.openOutputStream(uri)?.use { out ->
-                out.write(bytes)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
+        }
+        
+        var uri: android.net.Uri? = null
+        try {
+            uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+            if (uri != null) {
+                resolver.openOutputStream(uri)?.use { out ->
+                    out.write(bytes)
+                }
+                
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    contentValues.clear()
+                    contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    resolver.update(uri, contentValues, null, null)
+                }
+            } else {
+                Log.e(TAG, "Failed to create MediaStore URI for JPEG")
+                CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Failed to save photo.", Toast.LENGTH_SHORT).show() }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving JPEG bytes", e)
+            if (uri != null) {
+                resolver.delete(uri, null, null)
+            }
+            CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Storage Write Error.", Toast.LENGTH_SHORT).show() }
         }
     }
 
     private fun saveProcessedBitmap(bitmap: Bitmap) {
+        val resolver = contentResolver
         val contentValues = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, "AI_HDR_${System.currentTimeMillis()}.jpg")
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
         }
-        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-        if (uri != null) {
-            contentResolver.openOutputStream(uri)?.use { out ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+        
+        var uri: android.net.Uri? = null
+        try {
+            uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+            if (uri != null) {
+                resolver.openOutputStream(uri)?.use { out ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                }
+                
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    contentValues.clear()
+                    contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    resolver.update(uri, contentValues, null, null)
+                }
+            } else {
+                Log.e(TAG, "Failed to create MediaStore URI for HDR Bitmap")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving HDR Bitmap", e)
+            if (uri != null) {
+                resolver.delete(uri, null, null)
             }
         }
     }
