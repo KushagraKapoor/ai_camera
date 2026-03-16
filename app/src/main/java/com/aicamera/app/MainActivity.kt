@@ -22,6 +22,8 @@ import android.os.HandlerThread
 import android.provider.MediaStore
 import android.util.Log
 import android.util.Size
+import android.view.GestureDetector
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
@@ -30,6 +32,8 @@ import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.aicamera.app.databinding.ActivityMainBinding
@@ -65,6 +69,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var stillImageReader: ImageReader
     private val capturedHdrImages = mutableListOf<ByteArray>()
 
+    private var isHdrEnabled = true
+    private var isAeAfLocked = false
+    private lateinit var gestureDetector: GestureDetector
+
+    /** A [Semaphore] to prevent the app from exiting before closing the camera. */
+    private val cameraOpenCloseLock = Semaphore(1)
+
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
             if (permissions.all { it.value }) {
@@ -90,6 +101,21 @@ class MainActivity : AppCompatActivity() {
         binding.btnCapture.setOnClickListener {
             takePhoto()
         }
+
+        binding.switchHdr.setOnCheckedChangeListener { _, isChecked ->
+            isHdrEnabled = isChecked
+        }
+
+        gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                handleFocusTap(e.x, e.y, binding.textureView.width, binding.textureView.height)
+                return true
+            }
+
+            override fun onLongPress(e: MotionEvent) {
+                handleFocusLock(e.x, e.y, binding.textureView.width, binding.textureView.height)
+            }
+        })
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -102,12 +128,18 @@ class MainActivity : AppCompatActivity() {
             binding.textureView.surfaceTextureListener = textureListener
         }
         
-        binding.textureView.setOnTouchListener { view, event ->
-            if (event.action == MotionEvent.ACTION_DOWN) {
-                handleFocusTap(event.x, event.y, view.width, view.height)
-            }
+        binding.textureView.setOnTouchListener { _, event ->
+            gestureDetector.onTouchEvent(event)
             true
         }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            takePhoto()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     override fun onPause() {
@@ -147,8 +179,12 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("MissingPermission")
     private fun startCamera() {
-        if (!allPermissionsGranted()) return
+        if (!allPermissionsGranted() || isFinishing || isDestroyed) return
         try {
+            if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
+                throw RuntimeException("Time out waiting to lock camera opening.")
+            }
+            
             for (id in cameraManager.cameraIdList) {
                 val characteristics = cameraManager.getCameraCharacteristics(id)
                 val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
@@ -160,24 +196,41 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            if (cameraId.isEmpty()) {
+                cameraOpenCloseLock.release()
+                return
+            }
+            
             cameraManager.openCamera(cameraId, stateCallback, backgroundHandler)
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Cannot access camera", e)
+            cameraOpenCloseLock.release()
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Missing camera permission", e)
+            cameraOpenCloseLock.release()
+        } catch (e: InterruptedException) {
+            throw RuntimeException("Interrupted while trying to lock camera opening.", e)
+        } catch (e: Exception) {
+            Log.e(TAG, "Unexpected error opening camera", e)
+            cameraOpenCloseLock.release()
         }
     }
 
     private val stateCallback = object : CameraDevice.StateCallback() {
         override fun onOpened(camera: CameraDevice) {
+            cameraOpenCloseLock.release()
             cameraDevice = camera
             createCameraPreviewSession()
         }
 
         override fun onDisconnected(camera: CameraDevice) {
+            cameraOpenCloseLock.release()
             camera.close()
             cameraDevice = null
         }
 
         override fun onError(camera: CameraDevice, error: Int) {
+            cameraOpenCloseLock.release()
             camera.close()
             cameraDevice = null
             finish()
@@ -227,14 +280,24 @@ class MainActivity : AppCompatActivity() {
                     val buffer = image.planes[0].buffer
                     val bytes = ByteArray(buffer.remaining())
                     buffer.get(bytes)
-                    capturedHdrImages.add(bytes)
                     image.close()
 
-                    if (capturedHdrImages.size == 3) {
-                        val imagesToProcess = capturedHdrImages.toList()
-                        capturedHdrImages.clear()
+                    if (isHdrEnabled) {
+                        capturedHdrImages.add(bytes)
+                        if (capturedHdrImages.size == 3) {
+                            val imagesToProcess = capturedHdrImages.toList()
+                            capturedHdrImages.clear()
+                            CoroutineScope(Dispatchers.Default).launch {
+                                processHdrAndSave(imagesToProcess)
+                            }
+                        }
+                    } else {
+                        // Single shot mode - direct save bypassing memory heavy Bitmap decoding
                         CoroutineScope(Dispatchers.Default).launch {
-                            processHdrAndSave(imagesToProcess)
+                            saveJpegBytes(bytes)
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(this@MainActivity, "Photo saved.", Toast.LENGTH_SHORT).show()
+                            }
                         }
                     }
                 } catch (e: Exception) {
@@ -332,9 +395,11 @@ class MainActivity : AppCompatActivity() {
     private fun handleFocusTap(x: Float, y: Float, viewWidth: Int, viewHeight: Int) {
         if (cameraDevice == null || captureSession == null || sensorArraySize == null) return
         isFocusing = true
+        isAeAfLocked = false // Unlock AE/AF on single tap
 
         // 1. Animate UI Ring
         val ring = binding.root.findViewById<ImageView>(R.id.ivFocusRing)
+        ring.setColorFilter(android.graphics.Color.WHITE) // Normal focus ring color
         ring.translationX = x - (ring.width / 2)
         ring.translationY = y - (ring.height / 2)
         ring.visibility = View.VISIBLE
@@ -385,6 +450,69 @@ class MainActivity : AppCompatActivity() {
             }, backgroundHandler)
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Failed manual focus", e)
+        }
+    }
+
+    private fun handleFocusLock(x: Float, y: Float, viewWidth: Int, viewHeight: Int) {
+        if (cameraDevice == null || captureSession == null || sensorArraySize == null) return
+        isFocusing = true
+        isAeAfLocked = true // Lock AE/AF on long press
+
+        // 1. Animate Lock UI Ring (Yellow indicates lock)
+        val ring = binding.root.findViewById<ImageView>(R.id.ivFocusRing)
+        ring.setColorFilter(android.graphics.Color.YELLOW)
+        ring.translationX = x - (ring.width / 2)
+        ring.translationY = y - (ring.height / 2)
+        ring.visibility = View.VISIBLE
+        ring.alpha = 1f
+        ring.scaleX = 2f
+        ring.scaleY = 2f
+        ring.animate().scaleX(1f).scaleY(1f).setDuration(300).withEndAction {
+            ring.animate().alpha(0f).setStartDelay(1500).setDuration(300).withEndAction {
+                ring.visibility = View.GONE
+            }.start()
+        }.start()
+
+        // 2. Calculate coordinates on sensor
+        val sensorX = (x / viewWidth * sensorArraySize!!.width()).toInt()
+        val sensorY = (y / viewHeight * sensorArraySize!!.height()).toInt()
+        val halfTouchWidth = 150 
+        val halfTouchHeight = 150 
+        
+        val focusRect = android.graphics.Rect(
+            (sensorX - halfTouchWidth).coerceAtLeast(0),
+            (sensorY - halfTouchHeight).coerceAtLeast(0),
+            (sensorX + halfTouchWidth).coerceAtMost(sensorArraySize!!.width()),
+            (sensorY + halfTouchHeight).coerceAtMost(sensorArraySize!!.height())
+        )
+        val meteringRectangle = MeteringRectangle(focusRect, MeteringRectangle.METERING_WEIGHT_MAX)
+
+        // 3. Command Camera to Focus and lock
+        try {
+            captureSession!!.stopRepeating()
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(meteringRectangle))
+            captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+            
+            captureSession!!.capture(captureRequestBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
+                 override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                     isFocusing = false
+                     
+                     val focusDistance = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
+                     if (focusDistance != null) {
+                         currentFocusDistance = focusDistance
+                     }
+
+                     captureRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+                     updateCameraPreview()
+                 }
+            }, backgroundHandler)
+        } catch (e: CameraAccessException) {
+            Log.e(TAG, "Failed manual focus lock", e)
+        }
+        
+        CoroutineScope(Dispatchers.Main).launch {
+            binding.tvAiStatus.text = "AI Status: AE/AF Locked"
         }
     }
 
@@ -440,6 +568,10 @@ class MainActivity : AppCompatActivity() {
     }
     
     private fun adjustSettingsBasedOnAI(luminance: Double, uCol: Double, vCol: Double) {
+        if (isAeAfLocked) {
+            return // Do not automatically adjust if locked
+        }
+
         // Target luminance (approx 128 for mid-grey)
         val targetLuminance = 120.0
         // User requested lower sensitivity/higher threshold before bouncing settings
@@ -523,6 +655,30 @@ class MainActivity : AppCompatActivity() {
         try {
             val jpegOrientation = getJpegOrientation()
 
+            if (!isHdrEnabled) {
+                // Request 1: Normal Exposure only
+                val captureBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                captureBuilder.addTarget(stillImageReader.surface)
+                setManualControlSettings(captureBuilder)
+                captureBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, currentIso)
+                captureBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, currentExposureTime)
+                captureBuilder.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(currentRGain, 1.0f, 1.0f, currentBGain))
+                captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
+
+                captureSession?.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                        super.onCaptureCompleted(session, request, result)
+                        Log.d(TAG, "Single Capture complete")
+                    }
+                }, null)
+                
+                CoroutineScope(Dispatchers.Main).launch {
+                    Toast.makeText(this@MainActivity, "Capturing Photo...", Toast.LENGTH_SHORT).show()
+                }
+                return
+            }
+
+            // HDR Logic:
             // Request 1: Highlight Recovery (Underexposed - 1/2 exposure time)
             val captureBuilder1 = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             captureBuilder1.addTarget(stillImageReader.surface)
@@ -636,8 +792,24 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this@MainActivity, "HDR Processing Failed.", Toast.LENGTH_SHORT).show()
             }
         } finally {
-            withContext(Dispatchers.Main) {
-                binding.tvAiStatus.text = "AI Status: Optimal"
+            if (!isAeAfLocked) {
+                withContext(Dispatchers.Main) {
+                    binding.tvAiStatus.text = "AI Status: Optimal"
+                }
+            }
+        }
+    }
+
+    private fun saveJpegBytes(bytes: ByteArray) {
+        val contentValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, "AI_CAM_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
+        }
+        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+        if (uri != null) {
+            contentResolver.openOutputStream(uri)?.use { out ->
+                out.write(bytes)
             }
         }
     }
@@ -658,10 +830,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun closeCamera() {
         try {
+            cameraOpenCloseLock.acquire()
             captureSession?.close()
             captureSession = null
+            
             cameraDevice?.close()
             cameraDevice = null
+            
             if (::imageReader.isInitialized) {
                  imageReader.setOnImageAvailableListener(null, null)
                  imageReader.close()
@@ -670,8 +845,14 @@ class MainActivity : AppCompatActivity() {
                  stillImageReader.setOnImageAvailableListener(null, null)
                  stillImageReader.close()
             }
+            
+            capturedHdrImages.clear()
+        } catch (e: InterruptedException) {
+            throw RuntimeException("Interrupted while trying to lock camera closing.", e)
         } catch (e: Exception) {
             Log.e(TAG, "Error closing camera resources", e)
+        } finally {
+            cameraOpenCloseLock.release()
         }
     }
 
