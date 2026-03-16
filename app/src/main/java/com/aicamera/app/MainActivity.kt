@@ -706,6 +706,12 @@ class MainActivity : AppCompatActivity() {
                         super.onCaptureCompleted(session, request, result)
                         Log.d(TAG, "Single Capture complete")
                     }
+                    override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
+                        super.onCaptureFailed(session, request, failure)
+                        Log.e(TAG, "Camera HAL rejected capture. Reason: ${failure.reason}")
+                        CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Capture Failed. Disabling 50MP.", Toast.LENGTH_LONG).show() }
+                        isUltraHighResSensor = false
+                    }
                 }, null)
                 
                 CoroutineScope(Dispatchers.Main).launch {
@@ -754,6 +760,12 @@ class MainActivity : AppCompatActivity() {
                     override fun onCaptureSequenceCompleted(session: CameraCaptureSession, sequenceId: Int, frameNumber: Long) {
                         super.onCaptureSequenceCompleted(session, sequenceId, frameNumber)
                         Log.d(TAG, "HDR Burst Capture Sequence Complete")
+                    }
+                    override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
+                        super.onCaptureFailed(session, request, failure)
+                        Log.e(TAG, "HDR Burst capture failed. Reason: ${failure.reason}")
+                        CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Burst Failed. Disabling 50MP.", Toast.LENGTH_LONG).show() }
+                        isUltraHighResSensor = false
                     }
                 }, null
             )
@@ -842,8 +854,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun saveJpegBytes(bytes: ByteArray) {
         val resolver = contentResolver
+        val filename = "AI_CAM_${System.currentTimeMillis()}.jpg"
         val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "AI_CAM_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
@@ -864,23 +877,33 @@ class MainActivity : AppCompatActivity() {
                     contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
                     resolver.update(uri, contentValues, null, null)
                 }
-            } else {
-                Log.e(TAG, "Failed to create MediaStore URI for JPEG")
-                CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Failed to save photo.", Toast.LENGTH_SHORT).show() }
+                return // Success
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error saving JPEG bytes", e)
-            if (uri != null) {
-                resolver.delete(uri, null, null)
+            if (uri != null) resolver.delete(uri, null, null)
+        }
+
+        // Failsafe: Android 13/14/15/16 App-Specific External Directory
+        try {
+            val appDir = getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+            if (appDir != null) {
+                if (!appDir.exists()) appDir.mkdirs()
+                val file = java.io.File(appDir, filename)
+                file.writeBytes(bytes)
+                CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Saved to App Folder: ${file.absolutePath}", Toast.LENGTH_LONG).show() }
             }
-            CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Storage Write Error.", Toast.LENGTH_SHORT).show() }
+        } catch (e: Exception) {
+             Log.e(TAG, "Total save failure", e)
+             CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Storage Write Error.", Toast.LENGTH_SHORT).show() }
         }
     }
 
     private fun saveProcessedBitmap(bitmap: Bitmap) {
         val resolver = contentResolver
+        val filename = "AI_HDR_${System.currentTimeMillis()}.jpg"
         val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "AI_HDR_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/AICamera")
@@ -901,14 +924,26 @@ class MainActivity : AppCompatActivity() {
                     contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
                     resolver.update(uri, contentValues, null, null)
                 }
-            } else {
-                Log.e(TAG, "Failed to create MediaStore URI for HDR Bitmap")
+                return // Success
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error saving HDR Bitmap", e)
-            if (uri != null) {
-                resolver.delete(uri, null, null)
+            if (uri != null) resolver.delete(uri, null, null)
+        }
+
+        // Failsafe: Android 13/14/15/16 App-Specific External Directory
+        try {
+            val appDir = getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+            if (appDir != null) {
+                if (!appDir.exists()) appDir.mkdirs()
+                val file = java.io.File(appDir, filename)
+                file.outputStream().use { out ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                }
+                CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Saved to App Folder: ${file.absolutePath}", Toast.LENGTH_LONG).show() }
             }
+        } catch (e: Exception) {
+             Log.e(TAG, "Total save failure", e)
         }
     }
 
@@ -955,12 +990,7 @@ class MainActivity : AppCompatActivity() {
         private val REQUIRED_PERMISSIONS = mutableListOf(
             Manifest.permission.CAMERA
         ).apply {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                add(Manifest.permission.READ_MEDIA_IMAGES)
-                add(Manifest.permission.READ_MEDIA_VIDEO)
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                add(Manifest.permission.READ_EXTERNAL_STORAGE)
-            } else {
+            if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
                 add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 add(Manifest.permission.READ_EXTERNAL_STORAGE)
             }
