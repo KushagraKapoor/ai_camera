@@ -33,6 +33,7 @@ import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import androidx.appcompat.app.AppCompatActivity
@@ -336,29 +337,65 @@ class MainActivity : AppCompatActivity() {
 
             setManualControlSettings(captureRequestBuilder)
 
-            @Suppress("DEPRECATION")
-            cameraDevice!!.createCaptureSession(
-                listOf(previewSurface, imageReader.surface, stillImageReader.surface),
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(session: CameraCaptureSession) {
-                        if (cameraDevice == null) return
-                        captureSession = session
-                        try {
-                            captureSession!!.setRepeatingRequest(
-                                captureRequestBuilder.build(),
-                                null,
-                                backgroundHandler
-                            )
-                        } catch (e: CameraAccessException) {
-                            Log.e(TAG, "Failed to start camera preview", e)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val previewConfig = android.hardware.camera2.params.OutputConfiguration(previewSurface)
+                val analysisConfig = android.hardware.camera2.params.OutputConfiguration(imageReader.surface)
+                val stillConfig = android.hardware.camera2.params.OutputConfiguration(stillImageReader.surface)
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && isUltraHighResSensor) {
+                    stillConfig.addSensorPixelModeUsed(CameraMetadata.SENSOR_PIXEL_MODE_MAXIMUM_RESOLUTION)
+                }
+
+                val sessionConfig = android.hardware.camera2.params.SessionConfiguration(
+                    android.hardware.camera2.params.SessionConfiguration.SESSION_REGULAR,
+                    listOf(previewConfig, analysisConfig, stillConfig),
+                    Executors.newSingleThreadExecutor(),
+                    object : CameraCaptureSession.StateCallback() {
+                        override fun onConfigured(session: CameraCaptureSession) {
+                            if (cameraDevice == null) return
+                            captureSession = session
+                            try {
+                                captureSession!!.setRepeatingRequest(
+                                    captureRequestBuilder.build(),
+                                    null,
+                                    backgroundHandler
+                                )
+                            } catch (e: CameraAccessException) {
+                                Log.e(TAG, "Failed to start camera preview", e)
+                            }
+                        }
+
+                        override fun onConfigureFailed(session: CameraCaptureSession) {
+                            CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Configuration change", Toast.LENGTH_SHORT).show() }
                         }
                     }
+                )
+                cameraDevice!!.createCaptureSession(sessionConfig)
+            } else {
+                @Suppress("DEPRECATION")
+                cameraDevice!!.createCaptureSession(
+                    listOf(previewSurface, imageReader.surface, stillImageReader.surface),
+                    object : CameraCaptureSession.StateCallback() {
+                        override fun onConfigured(session: CameraCaptureSession) {
+                            if (cameraDevice == null) return
+                            captureSession = session
+                            try {
+                                captureSession!!.setRepeatingRequest(
+                                    captureRequestBuilder.build(),
+                                    null,
+                                    backgroundHandler
+                                )
+                            } catch (e: CameraAccessException) {
+                                Log.e(TAG, "Failed to start camera preview", e)
+                            }
+                        }
 
-                    override fun onConfigureFailed(session: CameraCaptureSession) {
-                        Toast.makeText(this@MainActivity, "Configuration change", Toast.LENGTH_SHORT).show()
-                    }
-                }, null
-            )
+                        override fun onConfigureFailed(session: CameraCaptureSession) {
+                            CoroutineScope(Dispatchers.Main).launch { Toast.makeText(this@MainActivity, "Configuration change", Toast.LENGTH_SHORT).show() }
+                        }
+                    }, null
+                )
+            }
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Failed creating capture session", e)
         }
